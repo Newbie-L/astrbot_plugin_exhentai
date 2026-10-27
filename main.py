@@ -57,7 +57,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
 PLUGIN_NAME = "astrbot_plugin_exhentai"
-PLUGIN_VERSION = "0.2.2"
+PLUGIN_VERSION = "0.2.3"
 PLUGIN_REPO = "https://github.com/Newbie-L/astrbot_plugin_exhentai"
 
 # https://exhentai.org/g/1234567/abcdef1234/  /  https://e-hentai.org/g/...
@@ -402,7 +402,10 @@ class ExHentaiDownloader(Star):
                 f"✅ gid={gid} 已经下载过："
                 f"{item.get('zip_path') or item.get('folder', '')}"
             )
-        if item.get("status") in ("queued", "downloading", "zipping"):
+        # 正在跑的任务才算在队列里。重启插件后 _tasks 是空的，
+        # 旧状态还停在 downloading 时不能直接说“已在队列”，否则永远卡住。
+        _live = self._tasks.get(gid)
+        if item.get("status") in ("queued", "downloading", "zipping") and _live is not None and not _live.done():
             return f"⏳ gid={gid} 已在队列中：{item.get('title') or link['url']}"
         if item.get("status") == "partial" or (
             item.get("status") in ("done", "sent", "zip_ready")
@@ -443,6 +446,8 @@ class ExHentaiDownloader(Star):
         done = item.get("downloaded") or 0
         title = item.get("title") or item.get("url", "")
         line = f"- {gid} [{status}] {done}/{total} {title}"
+        if item.get("current_idx"):
+            line += f"\n  当前正在下第 {item['current_idx']} 张"
         if item.get("missing"):
             line += f"\n  缺图序号：{item['missing']}"
         if item.get("folder"):
@@ -542,14 +547,28 @@ class ExHentaiDownloader(Star):
                             "没解析到任何图片页：可能是 cookie 失效、画廊被删、"
                             "或被限流（509），请先检查 exhentai 登录状态"
                         )
+                    # 总数以 metadata 为准：如果解析到的图片页少于总数，
+                    # 超出的序号也算缺图，不能悄悄截断成“已完成”。
+                    final_total = total if total else len(image_pages)
                     if total and len(image_pages) < total:
                         logger.warning(
                             f"[{PLUGIN_NAME}] gid={gid} 只解析到 "
-                            f"{len(image_pages)}/{total} 张图片页，继续按已解析的下载"
+                            f"{len(image_pages)}/{total} 张图片页"
                         )
                     downloaded = 0
                     missing: list[int] = []
+                    # 先把未解析到的尾部序号记为缺图，下载循环只跑已解析的页
+                    unparsed_missing = (
+                        list(range(len(image_pages) + 1, total + 1))
+                        if total and len(image_pages) < total else []
+                    )
                     for idx, page_url in enumerate(image_pages, start=1):
+                        # 状态每张都更新，之前只每 10 张更新一次，
+                        # 查状态时会误以为卡在旧数字上不动。
+                        self._set_state(gid, current_idx=idx,
+                                        downloaded=downloaded,
+                                        total=final_total,
+                                        missing=missing + unparsed_missing)
                         ok = await self._download_one_image(
                             session, page_url, folder, idx
                         )
@@ -557,11 +576,12 @@ class ExHentaiDownloader(Star):
                             downloaded += 1
                         else:
                             missing.append(idx)
-                        if idx % 10 == 0:
-                            self._set_state(gid, downloaded=downloaded,
-                                            total=len(image_pages),
-                                            missing=missing)
+                        self._set_state(gid, current_idx=idx,
+                                        downloaded=downloaded,
+                                        total=final_total,
+                                        missing=missing + unparsed_missing)
                         await asyncio.sleep(delay)
+                    missing = missing + unparsed_missing
                     # 缺图自动重下：第一遍没下到的序号再单独跑最多 2 轮，
                     # 每轮间隔拉长一点，避免 509 时硬刷。2 轮后还缺的，
                     # 才标 partial，等用户再跑 /ex_dl 补下，不发不完整包。
@@ -575,6 +595,11 @@ class ExHentaiDownloader(Star):
                         await asyncio.sleep(delay * 2)
                         still_missing: list[int] = []
                         for idx in list(missing):
+                            if idx > len(image_pages):
+                                # 未解析到的尾部序号没有图片页可重试，
+                                # 留到下次重跑时重新收集画廊分页再补。
+                                still_missing.append(idx)
+                                continue
                             page_url = image_pages[idx - 1]
                             ok = await self._download_one_image(
                                 session, page_url, folder, idx
@@ -586,13 +611,14 @@ class ExHentaiDownloader(Star):
                             await asyncio.sleep(delay)
                         missing = still_missing
                         self._set_state(gid, downloaded=downloaded,
-                                        total=len(image_pages),
+                                        total=final_total,
                                         missing=missing)
                     self._set_state(gid, status="done", downloaded=downloaded,
-                                    total=len(image_pages), missing=missing)
+                                    total=final_total, missing=missing,
+                                    current_idx=0)
                     logger.info(
                         f"[{PLUGIN_NAME}] gid={gid} 下载完成 "
-                        f"{downloaded}/{len(image_pages)} -> {folder} "
+                        f"{downloaded}/{final_total} -> {folder} "
                         f"缺图：{missing}"
                     )
                     if downloaded == 0:
@@ -703,7 +729,14 @@ class ExHentaiDownloader(Star):
 
     async def _collect_image_pages(self, session, host: str, gid: str,
                                    token: str, total: int) -> list[str]:
-        """翻画廊分页，收集全部图片页 URL。画廊每页约 40 张缩略图。"""
+        """翻画廊分页，收集全部图片页 URL。
+
+        v0.2.2 之前的 bug：假设每页 40 张、本页不足 40 张就停。
+        如果账号设置是每页 20 张，第一页 20 张就会提前停，
+        44 张的画廊只会拿到前 20 张，状态就从 20/20 变成 44 这种
+        让人困惑的数字。改成：只有本页没解析出任何新图片页时才停，
+        否则一直翻到总数（metadata 的 filecount）为止。
+        """
         pages: list[str] = []
         seen: set[str] = set()
         page_no = 0
@@ -716,14 +749,16 @@ class ExHentaiDownloader(Star):
                     )
                     break
                 html = await resp.text(errors="ignore")
-            for page_url in self._extract_page_urls(html, gid):
+            new_urls = self._extract_page_urls(html, gid)
+            new_count = 0
+            for page_url in new_urls:
                 if page_url not in seen:
                     seen.add(page_url)
                     pages.append(page_url)
+                    new_count += 1
             if total and len(pages) >= total:
                 break
-            # 没有“下一页”迹象就停：本页缩略图不足一页，或已到最后一页
-            if len(parse_image_page_links(html, gid)) < 40:
+            if new_count == 0:
                 break
             page_no += 1
             if page_no > 500:  # 安全上限，防止死循环
