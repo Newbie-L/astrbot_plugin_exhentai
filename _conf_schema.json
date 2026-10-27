@@ -1,1 +1,64 @@
-{"delete_images_after_zip":{"default":false,"description":"压缩成功后删除原图片文件（保留 metadata.json）","hint":"默认不删，方便压缩或发送失败时重试。","type":"bool"},"download_delay":{"default":"1.0","description":"每张图之间的间隔（秒）","hint":"默认 1.0。被限流时插件会在 509 处额外等 60 秒。","type":"string"},"download_dir":{"default":"","description":"下载目录（留空则用插件数据目录下的 downloads）","hint":"图片文件夹和加密压缩包都放在这里。","type":"string"},"igneous":{"default":"","description":"ExHentai 入站 cookie：igneous","hint":"没有它 exhentai.org 只会显示 sad panda。同样从你自己的浏览器 cookie 里复制。","invisible":true,"type":"string"},"ipb_member_id":{"default":"","description":"ExHentai 登录 cookie：ipb_member_id","hint":"从你自己登录 exhentai.org 的浏览器 cookie 里复制。只填你自己的，不要分享给别人。","invisible":true,"type":"string"},"ipb_pass_hash":{"default":"","description":"ExHentai 登录 cookie：ipb_pass_hash","hint":"从你自己登录 exhentai.org 的浏览器 cookie 里复制。","invisible":true,"type":"string"},"max_concurrent":{"default":1,"description":"同时下载的画廊数","hint":"默认 1。ExHentai 有流量配额，并发拉满很容易 509。","max":3,"min":1,"type":"int"},"only_private":{"default":true,"description":"只在私聊里自动触发（群聊链接不下载）","hint":"默认开启，避免群里有人随手发链接就触发下载。只影响自动监听，手动 /ex_dl 不受此开关限制。","type":"bool"},"send_zip_to_group":{"default":true,"description":"下载压缩完后把压缩包和密码发到群聊","hint":"关闭后只留在本地，用 /ex_send 手动补发。","type":"bool"},"target_group_umo":{"default":"","description":"发压缩包的目标群 unified_msg_origin（留空则发回触发时的群）","hint":"例如 aiocqhttp:GroupMessage:123456789。私聊触发又没配这个时，插件不会猜群，只会把包留在本地等 /ex_send。","type":"string"}}
+{
+  "delete_images_after_zip": {
+    "default": false,
+    "description": "压缩成功后删除原图片文件（保留 metadata.json）",
+    "hint": "默认不删，方便压缩或发送失败时重试。",
+    "type": "bool"
+  },
+  "download_delay": {
+    "default": "1.0",
+    "description": "每张图之间的间隔（秒）",
+    "hint": "默认 1.0。被限流时插件会在 509 处额外等 60 秒。",
+    "type": "string"
+  },
+  "download_dir": {
+    "default": "",
+    "description": "下载目录（留空则用插件数据目录下的 downloads）",
+    "hint": "图片文件夹和加密压缩包都放在这里。",
+    "type": "string"
+  },
+  "igneous": {
+    "default": "",
+    "description": "ExHentai 入站 cookie：igneous",
+    "hint": "没有它 exhentai.org 只会显示 sad panda。同样从你自己的浏览器 cookie 里复制。 注意：AstrBot 这里没有密码框，填进去后在后台是明文显示的，只在你自己的服务器后台填，不要截图外发。",
+    "type": "string"
+  },
+  "ipb_member_id": {
+    "default": "",
+    "description": "ExHentai 登录 cookie：ipb_member_id",
+    "hint": "从你自己登录 exhentai.org 的浏览器 cookie 里复制。只填你自己的，不要分享给别人。 注意：AstrBot 这里没有密码框，填进去后在后台是明文显示的，只在你自己的服务器后台填，不要截图外发。",
+    "type": "string"
+  },
+  "ipb_pass_hash": {
+    "default": "",
+    "description": "ExHentai 登录 cookie：ipb_pass_hash",
+    "hint": "从你自己登录 exhentai.org 的浏览器 cookie 里复制。 注意：AstrBot 这里没有密码框，填进去后在后台是明文显示的，只在你自己的服务器后台填，不要截图外发。",
+    "type": "string"
+  },
+  "max_concurrent": {
+    "default": 1,
+    "description": "同时下载的画廊数",
+    "hint": "默认 1。ExHentai 有流量配额，并发拉满很容易 509。",
+    "max": 3,
+    "min": 1,
+    "type": "int"
+  },
+  "only_private": {
+    "default": true,
+    "description": "只在私聊里自动触发（群聊链接不下载）",
+    "hint": "默认开启，避免群里有人随手发链接就触发下载。只影响自动监听，手动 /ex_dl 不受此开关限制。",
+    "type": "bool"
+  },
+  "send_zip_to_group": {
+    "default": true,
+    "description": "下载压缩完后把压缩包和密码发到群聊",
+    "hint": "关闭后只留在本地，用 /ex_send 手动补发。",
+    "type": "bool"
+  },
+  "target_group_umo": {
+    "default": "",
+    "description": "发压缩包的目标群 unified_msg_origin（留空则发回触发时的群）",
+    "hint": "例如 aiocqhttp:GroupMessage:123456789。私聊触发又没配这个时，插件不会猜群，只会把包留在本地等 /ex_send。",
+    "type": "string"
+  }
+}
