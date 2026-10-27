@@ -52,13 +52,13 @@
   "send_zip_to_group": {
     "default": true,
     "description": "下载压缩完后把压缩包和密码发到群聊",
-    "hint": "关闭后只留在本地，用 /ex_send 手动补发。",
+    "hint": "关闭后只留在本地，用 /ex_send 手动补发。开启时按 target_group_umo 或触发会话发送。",
     "type": "bool"
   },
   "target_group_umo": {
     "default": "",
     "description": "发压缩包的目标群 unified_msg_origin（留空则发回触发时的群）",
-    "hint": "例如 aiocqhttp:GroupMessage:123456789。私聊触发又没配这个时，插件不会猜群，只会把包留在本地等 /ex_send。",
+    "hint": "例如 aiocqhttp:GroupMessage:123456789。留空则发回触发会话：群触发发回群，私聊触发发回私聊。",
     "type": "string"
   }
 }

@@ -1,20 +1,24 @@
 """ExHentai / E-Hentai 画廊下载插件 for AstrBot.
 
-工作方式（v0.2）：
+工作方式（v0.2.2）：
 1. 私聊里发一条带 exhentai.org / e-hentai.org 画廊链接的消息，
    或手动发 `/ex_dl <链接>`，插件把该画廊加入下载队列。
 2. 后台按画廊页 -> 图片页 -> 原图的顺序逐张下载到服务器本地。
-3. 下载完后把图片打成加密 zip：密码是随机 6 位数字，
+   单张失败重试 3 次，整遍下完后缺的序号再自动重下最多 2 轮，
+   残文件写 .part、完整才重命名，不会把残文件当成功。
+   2 轮后还缺的标 partial，不发不完整包，再跑 /ex_dl 只补缺的序号。
+3. 下载完且无缺图后把图片打成加密 zip：密码是随机 6 位数字，
    压缩包名就是画廊标题（去掉文件名非法字符、截断到 120 字）。
-4. 压缩完后把压缩包和密码发到群聊：
+4. 压缩完后把压缩包和密码发到触发会话：
    - 优先发到配置里的 `target_group_umo`；
-   - 没配的话，如果触发消息本身就在群里，就发回那个群；
-   - 两者都没有，就只留在本地，状态为 zip_ready，
-     可用 `/ex_send <gid>` 在当前会话手动补发。
-   注意：密码和压缩包发在同一条群消息里，群成员都能打开，
-   加密主要防的是平台扫描 / 非群成员直接拿到文件，6 位密码
+   - 没配的话就发回触发会话：群触发发回群，私聊触发发回私聊。
+     v0.2.1 之前这里只认群，私聊触发会 no_target、哪里都不发，
+     这是 bug，v0.2.2 已修。
+   注意：密码和压缩包发在同一条消息里，收到的人都能打开，
+   加密主要防的是平台扫描 / 非接收者直接拿到文件，6 位密码
    本身也不抗暴力破解，别把它当成强保密手段。
-5. 用 `/ex_status` 查进度、压缩包路径和密码，`/ex_list` 看已完成的。
+5. 用 `/ex_status` 查进度、压缩包路径、密码和缺图序号，
+   `/ex_list` 看已完成的，`/ex_send <gid>` 在当前会话手动补发。
 
 关键前提，实话先说在前面：
 - exhentai.org 不是公开站：必须登录，且浏览器里要有 `igneous` cookie
@@ -53,7 +57,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
 PLUGIN_NAME = "astrbot_plugin_exhentai"
-PLUGIN_VERSION = "0.2.1"
+PLUGIN_VERSION = "0.2.2"
 PLUGIN_REPO = "https://github.com/Newbie-L/astrbot_plugin_exhentai"
 
 # https://exhentai.org/g/1234567/abcdef1234/  /  https://e-hentai.org/g/...
@@ -362,7 +366,7 @@ class ExHentaiDownloader(Star):
     async def downloaded_list(self, event: AstrMessageEvent):
         """/ex_list：列出已下载完成（含压缩包）的画廊。"""
         done = [(g, i) for g, i in self.state.items()
-                if i.get("status") in ("done", "sent", "zip_ready")]
+                if i.get("status") in ("done", "sent", "zip_ready", "partial")]
         if not done:
             yield event.plain_result("还没有下载完成的画廊。")
             return
@@ -384,18 +388,44 @@ class ExHentaiDownloader(Star):
     def _enqueue(self, link: dict, origin_umo: str = "") -> str:
         gid = link["gid"]
         item = self.state.get(gid, {})
-        if item.get("status") in ("done", "sent", "zip_ready"):
+        # 旧版已完成但实际缺图（downloaded < total）也视为未完成，允许补下。
+        # 新版缺图状态是 partial，同样允许重进队列只补缺的序号。
+        already_done = (
+            item.get("status") in ("done", "sent", "zip_ready")
+            and not (
+                (item.get("total") or 0) > 0
+                and (item.get("downloaded") or 0) < item["total"]
+            )
+        )
+        if already_done:
             return (
                 f"✅ gid={gid} 已经下载过："
                 f"{item.get('zip_path') or item.get('folder', '')}"
             )
         if item.get("status") in ("queued", "downloading", "zipping"):
             return f"⏳ gid={gid} 已在队列中：{item.get('title') or link['url']}"
+        if item.get("status") == "partial" or (
+            item.get("status") in ("done", "sent", "zip_ready")
+            and (item.get("total") or 0) > 0
+            and (item.get("downloaded") or 0) < item["total"]
+        ):
+            # 补下：保留已下载的图片和原压缩包路径，只重跑下载循环，
+            # _download_one 里已存在的文件会跳过，只补缺的序号。
+            task = asyncio.create_task(self._download_one(link))
+            self._tasks[gid] = task
+            self._set_state(gid, status="queued", origin_umo=origin_umo,
+                            error="")
+            missing = item.get("missing") or []
+            return (
+                f"🔁 gid={gid} 上次缺图，正在补下"
+                f"{f'（缺：{missing}）' if missing else ''}，"
+                f"补完会重新压缩并按触发会话发送。"
+            )
         self._set_state(gid, url=link["url"], host=link["host"],
                        token=link["token"], status="queued",
                        title="", downloaded=0, total=0, error="",
                        origin_umo=origin_umo, zip_path="", zip_password="",
-                       send_status="")
+                       send_status="", missing=[])
         task = asyncio.create_task(self._download_one(link))
         self._tasks[gid] = task
         if link["host"] == "exhentai.org" and not self._cookies():
@@ -413,6 +443,8 @@ class ExHentaiDownloader(Star):
         done = item.get("downloaded") or 0
         title = item.get("title") or item.get("url", "")
         line = f"- {gid} [{status}] {done}/{total} {title}"
+        if item.get("missing"):
+            line += f"\n  缺图序号：{item['missing']}"
         if item.get("folder"):
             line += f"\n  图片目录：{item['folder']}"
         if item.get("zip_path"):
@@ -427,15 +459,17 @@ class ExHentaiDownloader(Star):
 
     # ------------------------------------------------------------ 发群
     def _send_target(self, gid: str) -> str:
-        """决定发到哪个会话：配置的群优先，其次是触发时的群会话。"""
+        """决定发到哪个会话：配置的群优先，其次是触发时的会话。
+
+        之前这里只认 GroupMessage，私聊触发会返回空、导致 no_target、
+        压缩包明明生成了却哪里都不发——这是 v0.2.1 的 bug。
+        改成：没配目标群时就发回触发会话，群触发发回群，私聊触发发回私聊。
+        """
         configured = str(self._cfg("target_group_umo", "") or "").strip()
         if configured:
             return configured
         origin = str(self.state.get(gid, {}).get("origin_umo") or "")
-        # 只有 GroupMessage 类型的触发会话才算群，私聊触发不自动发群
-        if "GroupMessage" in origin:
-            return origin
-        return ""
+        return origin
 
     async def _send_zip_to_target(self, gid: str, title: str,
                                   zip_path: Path, password: str) -> str:
@@ -514,23 +548,92 @@ class ExHentaiDownloader(Star):
                             f"{len(image_pages)}/{total} 张图片页，继续按已解析的下载"
                         )
                     downloaded = 0
+                    missing: list[int] = []
                     for idx, page_url in enumerate(image_pages, start=1):
                         ok = await self._download_one_image(
                             session, page_url, folder, idx
                         )
                         if ok:
                             downloaded += 1
+                        else:
+                            missing.append(idx)
                         if idx % 10 == 0:
                             self._set_state(gid, downloaded=downloaded,
-                                            total=len(image_pages))
+                                            total=len(image_pages),
+                                            missing=missing)
                         await asyncio.sleep(delay)
+                    # 缺图自动重下：第一遍没下到的序号再单独跑最多 2 轮，
+                    # 每轮间隔拉长一点，避免 509 时硬刷。2 轮后还缺的，
+                    # 才标 partial，等用户再跑 /ex_dl 补下，不发不完整包。
+                    for retry_round in range(2):
+                        if not missing:
+                            break
+                        logger.warning(
+                            f"[{PLUGIN_NAME}] gid={gid} 第 {retry_round + 1} 轮"
+                            f"重下缺图：{missing}"
+                        )
+                        await asyncio.sleep(delay * 2)
+                        still_missing: list[int] = []
+                        for idx in list(missing):
+                            page_url = image_pages[idx - 1]
+                            ok = await self._download_one_image(
+                                session, page_url, folder, idx
+                            )
+                            if ok:
+                                downloaded += 1
+                            else:
+                                still_missing.append(idx)
+                            await asyncio.sleep(delay)
+                        missing = still_missing
+                        self._set_state(gid, downloaded=downloaded,
+                                        total=len(image_pages),
+                                        missing=missing)
                     self._set_state(gid, status="done", downloaded=downloaded,
-                                    total=len(image_pages))
+                                    total=len(image_pages), missing=missing)
                     logger.info(
                         f"[{PLUGIN_NAME}] gid={gid} 下载完成 "
-                        f"{downloaded}/{len(image_pages)} -> {folder}"
+                        f"{downloaded}/{len(image_pages)} -> {folder} "
+                        f"缺图：{missing}"
                     )
-                    # ---- 下载完：压缩成加密 zip，包名 = 画廊标题 ----
+                    if downloaded == 0:
+                        # 一张都没下成功就不是 done，避免误导
+                        self._set_state(
+                            gid, status="failed",
+                            error="一张图都没下成功，请检查 cookie / 509 限流后重试",
+                        )
+                        return
+                    if missing:
+                        # 缺图时先不发群，避免把不完整的包当成完整包发出。
+                        # 状态标 partial，再跑 /ex_dl 会只补缺的序号。
+                        self._set_state(gid, status="partial")
+                        logger.warning(
+                            f"[{PLUGIN_NAME}] gid={gid} 缺图 {missing}，"
+                            f"暂不发群，等补下完成后再压缩发送"
+                        )
+                        # 仍先打一个现有图片的包备查，但不自动发送
+                        self._set_state(gid, status="zipping")
+                        zip_name = f"{sanitize_filename(title, 120)}.zip"
+                        zip_path = self._download_dir() / zip_name
+                        password = generate_zip_password()
+                        try:
+                            method = await asyncio.to_thread(
+                                create_encrypted_zip, folder, zip_path, password
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                f"[{PLUGIN_NAME}] gid={gid} 压缩失败：{exc}"
+                            )
+                            self._set_state(
+                                gid, status="partial", error=str(exc)[:300]
+                            )
+                            return
+                        self._set_state(
+                            gid, status="partial", zip_path=str(zip_path),
+                            zip_password=password, zip_method=method,
+                            send_status="not_sent_missing_images",
+                        )
+                        return
+                    # ---- 下载完且无缺图：压缩成加密 zip，包名 = 画廊标题 ----
                     if downloaded > 0:
                         self._set_state(gid, status="zipping")
                         zip_name = f"{sanitize_filename(title, 120)}.zip"
@@ -640,7 +743,12 @@ class ExHentaiDownloader(Star):
 
     async def _download_one_image(self, session, page_url: str,
                                   folder: Path, idx: int) -> bool:
-        """下一张图：图片页 -> 原图地址 -> 落盘，失败重试 3 次。"""
+        """下一张图：图片页 -> 原图地址 -> 落盘，失败重试 3 次。
+
+        防残文件：先写到 .part 临时文件，完整写完才重命名为正式文件。
+        中途失败会删掉 .part，下次重试不会把残文件当成成功。
+        已存在且大于 0 的正式文件才算成功，直接跳过。
+        """
         for attempt in range(3):
             try:
                 async with session.get(page_url, timeout=30) as resp:
@@ -662,19 +770,32 @@ class ExHentaiDownloader(Star):
                 dest = folder / f"{idx:04d}{ext}"
                 if dest.exists() and dest.stat().st_size > 0:
                     return True
+                tmp = folder / f"{dest.name}.part"
                 async with session.get(
                     src, timeout=60,
                     headers={"Referer": page_url},
                 ) as resp:
                     if resp.status != 200:
+                        if tmp.exists():
+                            tmp.unlink()
                         return False
-                    with dest.open("wb") as fh:
+                    with tmp.open("wb") as fh:
                         async for chunk in resp.content.iter_chunked(65536):
                             fh.write(chunk)
-                return dest.stat().st_size > 0
+                if tmp.stat().st_size > 0:
+                    tmp.replace(dest)
+                    return True
+                tmp.unlink()
+                return False
             except Exception as exc:
                 logger.warning(
                     f"[{PLUGIN_NAME}] 图片 {idx} 第 {attempt + 1} 次失败：{exc}"
                 )
+                # 清掉本轮可能留下的残文件
+                try:
+                    for part in folder.glob(f"{idx:04d}.*.part"):
+                        part.unlink()
+                except Exception:
+                    pass
                 await asyncio.sleep(2 * (attempt + 1))
         return False
