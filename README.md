@@ -80,3 +80,6 @@ v0.2.5 修了发送失败：用户 AstrBot 里 astrbot.api.message_components �
 
 
 v0.2.6 修了 /ex_send 报错：chain_result 和 send_message 要的东西不一样，前者要组件列表，后者要 MessageChain 对象，之前统一包成 MessageChain 会在 result_decorate 里 len(result.chain) 报错。现在手动补发用列表、后台自动发送用 MessageChain。
+
+
+v0.2.7 修了空白图进包：只看 size > 0 会漏掉截断文件、HTML 错误页和空白占位图，而且重跑时又会因为已有文件直接跳过。新版下载和跳过时都验文件头/尾部（JPEG EOI、PNG IEND、WebP RIFF 长度），有 PIL 时还验纯色空白图；新增 /ex_verify <gid>，先校验、删掉坏图、只补坏的那几张，补完重新压缩发送。

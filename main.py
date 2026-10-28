@@ -1,6 +1,6 @@
 """ExHentai / E-Hentai 画廊下载插件 for AstrBot.
 
-工作方式（v0.2.6）：
+工作方式（v0.2.7）：
 1. 私聊里发一条带 exhentai.org / e-hentai.org 画廊链接的消息，
    或手动发 `/ex_dl <链接>`，插件把该画廊加入下载队列。
 2. 后台按画廊页 -> 图片页 -> 原图的顺序逐张下载到服务器本地。
@@ -57,7 +57,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
 PLUGIN_NAME = "astrbot_plugin_exhentai"
-PLUGIN_VERSION = "0.2.6"
+PLUGIN_VERSION = "0.2.7"
 PLUGIN_REPO = "https://github.com/Newbie-L/astrbot_plugin_exhentai"
 
 # https://exhentai.org/g/1234567/abcdef1234/  /  https://e-hentai.org/g/...
@@ -182,6 +182,68 @@ def _origin_umo(event: AstrMessageEvent) -> str:
         if isinstance(value, str) and value:
             return value
     return ""
+
+
+def _is_valid_image_file(path: Path) -> bool:
+    """检查一个已落盘的图片是不是真的完整图片，而不是残文件/错误页。
+
+    旧版只看 size > 0 就算成功：中途截断但没抛异常、或服务器返回了
+    HTML 错误页时，文件有大小却打不开/空白，之后重跑又会因为
+    size > 0 直接跳过，残图就这样进了压缩包。
+    检查分三层，越往后越严，缺 PIL 时只做前两层：
+    1. 文件头 magic：JPEG 以 FF D8 开头、PNG 以 PNG 头开头、
+       WebP 以 RIFF....WEBP 开头且 RIFF 长度字段要等于实际大小、
+       GIF 以 GIF87a/89a 开头，HTML（<html / <!DOCTYPE）直接判坏。
+    2. 文件尾：JPEG 必须以 FF D9 结尾、PNG 必须以 IEND 结尾、
+       WebP 的 RIFF 长度必须对得上，截断的文件尾一定对不上。
+    3. PIL 可用时：能完整打开并 load，且不是纯色空白图
+       （全像素同一个颜色，常见于占位/空白图）。
+    """
+    try:
+        size = path.stat().st_size
+        if size <= 0:
+            return False
+        with path.open("rb") as fh:
+            head = fh.read(16)
+            fh.seek(-16, 2) if size >= 16 else fh.seek(0)
+            tail = fh.read()
+        if head.lstrip()[:1] == b"<":
+            return False
+        if head.startswith(b"\xff\xd8"):
+            if not tail.endswith(b"\xff\xd9"):
+                return False
+        elif head.startswith(b"\x89PNG"):
+            if not tail.endswith(b"IEND\xaeB`\x82"):
+                return False
+        elif head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+            import struct
+
+            riff_size = struct.unpack("<I", head[4:8])[0]
+            if riff_size + 8 != size:
+                return False
+        elif head.startswith(b"GIF87a") or head.startswith(b"GIF89a"):
+            pass
+        else:
+            return False
+        try:
+            from PIL import Image
+
+            with Image.open(path) as im:
+                im.load()
+                # 纯色图：灰度极值相等，基本是空白占位图
+                try:
+                    gray = im.convert("L")
+                    if gray.getextrema()[0] == gray.getextrema()[1]:
+                        return False
+                except Exception:
+                    pass
+        except ImportError:
+            pass
+        except Exception:
+            return False
+        return True
+    except Exception:
+        return False
 
 
 def _build_components(text: str, zip_path: Path | None = None):
@@ -400,6 +462,62 @@ class ExHentaiDownloader(Star):
             logger.warning(f"[{PLUGIN_NAME}] 构造文件消息链失败：{exc}")
         yield event.plain_result(
             f"当前版本/平台发文件失败，包在服务器上：{zip_path}\n{text}"
+        )
+
+    @filter.command("ex_verify")
+    async def verify_images(self, event: AstrMessageEvent):
+        """/ex_verify <gid>：校验已下载的图片，把残图/空白图删掉并重下。
+
+        只看 size > 0 会漏掉残图：截断的文件、HTML 错误页、空白占位图
+        都有大小，打开却是空白的，而且重跑 /ex_dl 时又会因为已有文件
+        直接跳过，残图就一直留在包里。这个命令先逐张验 magic/尾部/
+        PIL（有 PIL 时还验纯色空白），把坏的删掉，再按原链接重跑，
+        只补坏的那几张，补完重新压缩发送。
+        """
+        gids = re.findall(r"\b\d{5,}\b", _message_text(event))
+        if not gids:
+            yield event.plain_result("用法：/ex_verify <gid>，例如 /ex_verify 4285225")
+            return
+        gid = gids[0]
+        item = self.state.get(gid)
+        if not item or not item.get("folder"):
+            yield event.plain_result(f"没找到 gid={gid} 的图片目录，先查 /ex_status {gid}。")
+            return
+        folder = Path(item["folder"])
+        if not folder.exists():
+            yield event.plain_result(f"图片目录找不到了：{folder}")
+            return
+        bad: list[int] = []
+        for p in sorted(folder.iterdir()):
+            m = re.match(r"(\d{4})\.(.+)$", p.name)
+            if not m or p.suffix == ".part":
+                continue
+            idx = int(m.group(1))
+            if not _is_valid_image_file(p):
+                bad.append(idx)
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+        if not bad:
+            yield event.plain_result(f"gid={gid} 校验通过：图片目录里没有残图/空白图。")
+            return
+        # 把状态改回 partial，让 _enqueue 走补下分支，只补坏的序号
+        total = item.get("total") or 0
+        downloaded = max(0, (item.get("downloaded") or 0) - len(bad))
+        self._set_state(gid, status="partial", missing=bad,
+                        downloaded=downloaded, total=total,
+                        send_status="not_sent_missing_images")
+        link = {"gid": gid, "token": item.get("token", ""),
+                "host": "exhentai.org", "url": item.get("url", "")}
+        # host 从原链接里恢复，避免默认 exhentai 误判 e-hentai 画廊
+        url = item.get("url") or ""
+        if "e-hentai.org" in url:
+            link["host"] = "e-hentai.org"
+        msg = self._enqueue(link, origin_umo=_origin_umo(event))
+        yield event.plain_result(
+            f"gid={gid} 校验发现坏图：{bad}，已删掉并开始重下，"
+            f"补完会重新压缩发送。\n{msg}"
         )
 
     @filter.command("ex_status")
@@ -861,9 +979,33 @@ class ExHentaiDownloader(Star):
                 ext = Path(urlparse(src).path).suffix or ".jpg"
                 if len(ext) > 5 or "/" in ext:
                     ext = ".jpg"
+                # 先看有没有同序号的旧文件（扩展名可能和这次不同），
+                # 完好的直接跳过，残图/空白图删掉重下，避免旧残图进包。
+                for old in folder.glob(f"{idx:04d}.*"):
+                    if old.suffix == ".part" or old.name == "metadata.json":
+                        continue
+                    if _is_valid_image_file(old):
+                        return True
+                    logger.warning(
+                        f"[{PLUGIN_NAME}] 图片 {idx} 旧文件校验失败，删掉重下：{old}"
+                    )
+                    try:
+                        old.unlink()
+                    except Exception:
+                        pass
                 dest = folder / f"{idx:04d}{ext}"
                 if dest.exists() and dest.stat().st_size > 0:
-                    return True
+                    # 有文件不等于图片完好：先验 magic/尾部/PIL，
+                    # 残图/空白图要删掉重下，不能直接跳过。
+                    if _is_valid_image_file(dest):
+                        return True
+                    logger.warning(
+                        f"[{PLUGIN_NAME}] 图片 {idx} 已有文件但校验失败，删掉重下：{dest}"
+                    )
+                    try:
+                        dest.unlink()
+                    except Exception:
+                        pass
                 tmp = folder / f"{dest.name}.part"
                 resume_from = tmp.stat().st_size if tmp.exists() else 0
                 headers = {"Referer": page_url}
