@@ -1,6 +1,6 @@
 """ExHentai / E-Hentai 画廊下载插件 for AstrBot.
 
-工作方式（v0.2.8）：
+工作方式（v0.2.9）：
 1. 私聊里发一条带 exhentai.org / e-hentai.org 画廊链接的消息，
    或手动发 `/ex_dl <链接>`，插件把该画廊加入下载队列。
 2. 后台按画廊页 -> 图片页 -> 原图的顺序逐张下载到服务器本地。
@@ -57,7 +57,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
 PLUGIN_NAME = "astrbot_plugin_exhentai"
-PLUGIN_VERSION = "0.2.8"
+PLUGIN_VERSION = "0.2.9"
 PLUGIN_REPO = "https://github.com/Newbie-L/astrbot_plugin_exhentai"
 
 # https://exhentai.org/g/1234567/abcdef1234/  /  https://e-hentai.org/g/...
@@ -535,7 +535,9 @@ class ExHentaiDownloader(Star):
             "下载完且无缺图时会自动压缩成加密 zip（随机 6 位密码，包名=画廊标题）"
             "并按触发会话发送：群触发发回群，私聊触发发回私聊；"
             "没配 target_group_umo 时也一样，配了就优先发到配置的群。"
-            "缺图时会标 partial、不发不完整包，再跑 /ex_dl 只补缺图。"
+            "缺图时不会悄悄停：超时/限流会持续重试（状态 retrying，"
+            "60 秒起步、逐轮拉长到 300 秒封顶，最多 30 轮），补完自动压缩发送；"
+            "30 轮后还缺的才标 partial、不发不完整包，并通知一次，再跑 /ex_dl 只补缺图。"
         )
 
     @filter.command("ex_status")
@@ -601,7 +603,7 @@ class ExHentaiDownloader(Star):
         # 正在跑的任务才算在队列里。重启插件后 _tasks 是空的，
         # 旧状态还停在 downloading 时不能直接说“已在队列”，否则永远卡住。
         _live = self._tasks.get(gid)
-        if item.get("status") in ("queued", "downloading", "zipping") and _live is not None and not _live.done():
+        if item.get("status") in ("queued", "downloading", "zipping", "retrying") and _live is not None and not _live.done():
             return f"⏳ gid={gid} 已在队列中：{item.get('title') or link['url']}"
         if item.get("status") == "partial" or (
             item.get("status") in ("done", "sent", "zip_ready")
@@ -644,6 +646,8 @@ class ExHentaiDownloader(Star):
         line = f"- {gid} [{status}] {done}/{total} {title}"
         if item.get("current_idx"):
             line += f"\n  当前正在下第 {item['current_idx']} 张"
+        if item.get("retry_round"):
+            line += f"\n  正在持续重试第 {item['retry_round']} 轮（超时/限流不会停，等一会再试）"
         if item.get("missing"):
             line += f"\n  缺图序号：{item['missing']}"
         if item.get("folder"):
@@ -701,6 +705,21 @@ class ExHentaiDownloader(Star):
             except Exception as exc2:
                 logger.warning(f"[{PLUGIN_NAME}] 降级发文本也失败：{exc2}")
                 return f"failed: {exc}"[:200]
+
+    async def _notify_target(self, gid: str, text: str) -> None:
+        """给触发会话发一条纯文本通知，失败就只记日志，不影响下载。
+
+        用来解决“超时自动暂停了我也不知道”：进入持续重试时通知一次，
+        持续重试耗尽后也通知一次，下载完自动发包本身就是通知。
+        """
+        target = self._send_target(gid)
+        if not target:
+            return
+        try:
+            chain, _ = _build_file_chain(text, None)
+            await self.context.send_message(target, chain)
+        except Exception as exc:
+            logger.warning(f"[{PLUGIN_NAME}] 通知 {target} 失败：{exc}")
 
     # ------------------------------------------------------------ 下载
     async def _download_one(self, link: dict) -> None:
@@ -772,8 +791,7 @@ class ExHentaiDownloader(Star):
                         await asyncio.sleep(delay)
                     missing = missing + unparsed_missing
                     # 缺图自动重下：第一遍没下到的序号再单独跑最多 2 轮，
-                    # 每轮间隔拉长一点，避免 509 时硬刷。2 轮后还缺的，
-                    # 才标 partial，等用户再跑 /ex_dl 补下，不发不完整包。
+                    # 每轮间隔拉长一点，避免 509 时硬刷。
                     for retry_round in range(2):
                         if not missing:
                             break
@@ -785,8 +803,6 @@ class ExHentaiDownloader(Star):
                         still_missing: list[int] = []
                         for idx in list(missing):
                             if idx > len(image_pages):
-                                # 未解析到的尾部序号没有图片页可重试，
-                                # 留到下次重跑时重新收集画廊分页再补。
                                 still_missing.append(idx)
                                 continue
                             page_url = image_pages[idx - 1]
@@ -802,6 +818,71 @@ class ExHentaiDownloader(Star):
                         self._set_state(gid, downloaded=downloaded,
                                         total=final_total,
                                         missing=missing)
+                    # 持续下载：2 轮后还缺的，之前会直接标 partial 停下来，
+                    # 用户不查状态就不知道它停了。现在改为持续重试：
+                    # 超时、TLS 断掉、509 这类临时失败会一直等、一直试，
+                    # 直到补完才压缩发送，不用用户手动再发链接。
+                    # 退避：60 秒起步，逐轮拉长到 300 秒封顶，避免 509 时硬刷。
+                    # 上限 30 轮（约 2 小时左右，够等配额恢复），耗尽后才
+                    # 标 partial 并通知一次，让用户知道而不是悄悄停了。
+                    # 未解析到的尾部序号每轮先重新收集画廊分页再试。
+                    if missing:
+                        retryable = [i for i in missing if i <= len(image_pages)]
+                        if retryable:
+                            await self._notify_target(
+                                gid,
+                                f"⏳ gid={gid} 还在持续下载，缺图：{missing}，"
+                                f"遇到超时/限流会自动等一会再试，不用手动重发，"
+                                f"下载完会自动压缩发送。",
+                            )
+                            for persistent_round in range(1, 31):
+                                if not missing:
+                                    break
+                                backoff = min(300, 60 * persistent_round)
+                                self._set_state(
+                                    gid, status="retrying",
+                                    retry_round=persistent_round,
+                                    downloaded=downloaded,
+                                    total=final_total, missing=missing,
+                                )
+                                logger.warning(
+                                    f"[{PLUGIN_NAME}] gid={gid} 持续重试"
+                                    f"第 {persistent_round} 轮，缺图：{missing}，"
+                                    f"等 {backoff} 秒"
+                                )
+                                await asyncio.sleep(backoff)
+                                # 尾部未解析的先重新收集分页
+                                if any(i > len(image_pages) for i in missing):
+                                    new_pages = await self._collect_image_pages(
+                                        session, host, gid, token, total
+                                    )
+                                    if new_pages:
+                                        image_pages = new_pages
+                                still_missing = []
+                                for idx in list(missing):
+                                    if idx > len(image_pages):
+                                        still_missing.append(idx)
+                                        continue
+                                    page_url = image_pages[idx - 1]
+                                    ok = await self._download_one_image(
+                                        session, page_url, folder, idx
+                                    )
+                                    if ok:
+                                        downloaded += 1
+                                    else:
+                                        still_missing.append(idx)
+                                    await asyncio.sleep(delay)
+                                missing = still_missing
+                                self._set_state(
+                                    gid, downloaded=downloaded,
+                                    total=final_total, missing=missing,
+                                )
+                            if missing:
+                                await self._notify_target(
+                                    gid,
+                                    f"⚠️ gid={gid} 持续重试 30 轮后仍缺图：{missing}，"
+                                    f"已先停下来，晚点再发一次链接或 /ex_dl 会继续补下。",
+                                )
                     self._set_state(gid, status="done", downloaded=downloaded,
                                     total=final_total, missing=missing,
                                     current_idx=0)
@@ -981,7 +1062,7 @@ class ExHentaiDownloader(Star):
         """
         for attempt in range(5):
             try:
-                async with session.get(page_url, timeout=30) as resp:
+                async with session.get(page_url, timeout=60) as resp:
                     if resp.status != 200:
                         if resp.status == 509:
                             logger.warning(
@@ -1030,7 +1111,7 @@ class ExHentaiDownloader(Star):
                 if resume_from > 0:
                     headers["Range"] = f"bytes={resume_from}-"
                 async with session.get(
-                    src, timeout=60, headers=headers,
+                    src, timeout=180, headers=headers,
                 ) as resp:
                     if resp.status == 416:
                         # Range 超出文件实际长度：说明 .part 已经不小于
