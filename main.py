@@ -1,6 +1,6 @@
 """ExHentai / E-Hentai 画廊下载插件 for AstrBot.
 
-工作方式（v0.2.5）：
+工作方式（v0.2.6）：
 1. 私聊里发一条带 exhentai.org / e-hentai.org 画廊链接的消息，
    或手动发 `/ex_dl <链接>`，插件把该画廊加入下载队列。
 2. 后台按画廊页 -> 图片页 -> 原图的顺序逐张下载到服务器本地。
@@ -57,7 +57,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
 PLUGIN_NAME = "astrbot_plugin_exhentai"
-PLUGIN_VERSION = "0.2.5"
+PLUGIN_VERSION = "0.2.6"
 PLUGIN_REPO = "https://github.com/Newbie-L/astrbot_plugin_exhentai"
 
 # https://exhentai.org/g/1234567/abcdef1234/  /  https://e-hentai.org/g/...
@@ -184,17 +184,12 @@ def _origin_umo(event: AstrMessageEvent) -> str:
     return ""
 
 
-def _build_file_chain(text: str, zip_path: Path | None = None):
-    """构造发文件用的消息链，兼容不同 AstrBot 版本。
+def _build_components(text: str, zip_path: Path | None = None):
+    """只拼组件列表，不包 MessageChain。
 
-    v0.2.4 之前直接从 astrbot.api.message_components import MessageChain，
-    但用户 AstrBot 里那个模块根本没有 MessageChain 这个名字，
-    导致下载 44/44 完成后发送一步就失败、降级文本也一样失败。
-    改成：先只 import 一定有的 Plain / File 构造组件列表，
-    再尝试在几个可能的位置找 MessageChain 包一层，找不到就直接用列表发
-    （很多版本里 send_message / chain_result 本来就接受组件列表）。
-    File 的参数名在不同版本也可能不同，依次试 file / file_path。
-    返回 (chain, has_file)，has_file 为 False 时说明只发了文本。
+    返回 (components, has_file)。
+    File 构造：name 必填、file 为本地路径（无 file_path 参数的版本
+    会在 file_path 尝试时失败，自动退到 file 形式）。
     """
     from astrbot.api.message_components import File, Plain
 
@@ -204,9 +199,8 @@ def _build_file_chain(text: str, zip_path: Path | None = None):
     file_comp = None
     for kwargs in (
         {"file": str(zip_path), "name": zip_path.name},
-        {"file_path": str(zip_path), "name": zip_path.name},
+        {"name": zip_path.name, "file": str(zip_path)},
         {"file": str(zip_path)},
-        {"file_path": str(zip_path)},
     ):
         try:
             file_comp = File(**kwargs)
@@ -216,12 +210,25 @@ def _build_file_chain(text: str, zip_path: Path | None = None):
     if file_comp is None:
         return components, False
     components.append(file_comp)
-    # 尝试找 MessageChain 包一层，找不到就用列表本身
+    return components, True
+
+
+def _build_file_chain(text: str, zip_path: Path | None = None):
+    """给 context.send_message 用的 MessageChain。
+
+    v0.2.5 的教训：chain_result 和 send_message 要的东西不一样。
+    chain_result 内部会对结果做 len(result.chain)，传 MessageChain
+    对象过去会报 object of type 'MessageChain' has no len()；
+    而 send_message 要的是 MessageChain 对象（定义在
+    astrbot.core.message.message_event_result，不在 message_components）。
+    所以这里专门包一层 MessageChain，chain_result 那边直接用列表。
+    找不到 MessageChain 时退回列表本身。
+    """
+    components, has_file = _build_components(text, zip_path)
     for mod_name in (
-        "astrbot.api.message_components",
-        "astrbot.api.event",
-        "astrbot.core.message.components",
         "astrbot.core.message.message_event_result",
+        "astrbot.api.event",
+        "astrbot.api.message_components",
     ):
         try:
             import importlib
@@ -231,15 +238,12 @@ def _build_file_chain(text: str, zip_path: Path | None = None):
             if chain_cls is None:
                 continue
             try:
-                return chain_cls(chain=components), True
+                return chain_cls(chain=components), has_file
             except Exception:
-                try:
-                    return chain_cls(components), True
-                except Exception:
-                    continue
+                continue
         except Exception:
             continue
-    return components, True
+    return components, has_file
 
 
 @register(
@@ -384,7 +388,10 @@ class ExHentaiDownloader(Star):
             f"解压密码：{item.get('zip_password', '')}"
         )
         try:
-            chain, has_file = _build_file_chain(text, zip_path)
+            # chain_result 要的是组件列表，不是 MessageChain 对象。
+            # 传 MessageChain 过去会在 result_decorate 里 len(result.chain)
+            # 报错：object of type 'MessageChain' has no len()。
+            chain, has_file = _build_components(text, zip_path)
             if hasattr(event, "chain_result"):
                 self._set_state(gids[0], send_status="sent_manually")
                 yield event.chain_result(chain)

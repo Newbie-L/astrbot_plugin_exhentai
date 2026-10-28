@@ -77,3 +77,6 @@ e-hentai.org 的公开画廊一般不需要 cookie；exhentai.org 没有 cookie 
 
 
 v0.2.5 修了发送失败：用户 AstrBot 里 astrbot.api.message_components 没有 MessageChain，下载 44/44 完成后发包和降级文本都因此失败。新代码只 import 一定有的 Plain / File，找不到 MessageChain 就直接用组件列表发，找不到时再按几个可能位置找一遍。
+
+
+v0.2.6 修了 /ex_send 报错：chain_result 和 send_message 要的东西不一样，前者要组件列表，后者要 MessageChain 对象，之前统一包成 MessageChain 会在 result_decorate 里 len(result.chain) 报错。现在手动补发用列表、后台自动发送用 MessageChain。
