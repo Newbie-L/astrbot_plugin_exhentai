@@ -1,6 +1,6 @@
 """ExHentai / E-Hentai 画廊下载插件 for AstrBot.
 
-工作方式（v0.2.2）：
+工作方式（v0.2.4）：
 1. 私聊里发一条带 exhentai.org / e-hentai.org 画廊链接的消息，
    或手动发 `/ex_dl <链接>`，插件把该画廊加入下载队列。
 2. 后台按画廊页 -> 图片页 -> 原图的顺序逐张下载到服务器本地。
@@ -57,7 +57,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
 PLUGIN_NAME = "astrbot_plugin_exhentai"
-PLUGIN_VERSION = "0.2.3"
+PLUGIN_VERSION = "0.2.4"
 PLUGIN_REPO = "https://github.com/Newbie-L/astrbot_plugin_exhentai"
 
 # https://exhentai.org/g/1234567/abcdef1234/  /  https://e-hentai.org/g/...
@@ -778,13 +778,19 @@ class ExHentaiDownloader(Star):
 
     async def _download_one_image(self, session, page_url: str,
                                   folder: Path, idx: int) -> bool:
-        """下一张图：图片页 -> 原图地址 -> 落盘，失败重试 3 次。
+        """下一张图：图片页 -> 原图地址 -> 落盘，失败重试 5 次，支持断点续传。
 
-        防残文件：先写到 .part 临时文件，完整写完才重命名为正式文件。
-        中途失败会删掉 .part，下次重试不会把残文件当成成功。
+        v0.2.4 之前的中断处理是 bug：下载中途 TLS 断掉（比如
+        ContentLengthError，27 号每次都卡在 273020/275256 字节，
+        只差最后 2KB），旧代码会在 except 里把 .part 删掉，
+        下一次又从 0 开始，永远在同一个位置断掉，浪费重试次数。
+        改成：.part 不删，下一次带 Range: bytes=<已下>- 续传，
+        服务器返回 206 就追加，返回 200（不支持 Range）才从头重下；
+        只有完整（大小等于 Content-Length / Content-Range 总数，
+        或无长度信息时成功读完）才重命名为正式文件。
         已存在且大于 0 的正式文件才算成功，直接跳过。
         """
-        for attempt in range(3):
+        for attempt in range(5):
             try:
                 async with session.get(page_url, timeout=30) as resp:
                     if resp.status != 200:
@@ -806,31 +812,59 @@ class ExHentaiDownloader(Star):
                 if dest.exists() and dest.stat().st_size > 0:
                     return True
                 tmp = folder / f"{dest.name}.part"
+                resume_from = tmp.stat().st_size if tmp.exists() else 0
+                headers = {"Referer": page_url}
+                if resume_from > 0:
+                    headers["Range"] = f"bytes={resume_from}-"
                 async with session.get(
-                    src, timeout=60,
-                    headers={"Referer": page_url},
+                    src, timeout=60, headers=headers,
                 ) as resp:
-                    if resp.status != 200:
-                        if tmp.exists():
-                            tmp.unlink()
+                    if resp.status == 416:
+                        # Range 超出文件实际长度：说明 .part 已经不小于
+                        # 服务器上的文件，可能是长度头本身有误，保留 .part
+                        # 供人工检查，但不把它当成功，避免发残图。
+                        logger.warning(
+                            f"[{PLUGIN_NAME}] 图片 {idx} Range 超出范围，"
+                            f".part 已有 {resume_from} 字节"
+                        )
                         return False
-                    with tmp.open("wb") as fh:
+                    if resp.status not in (200, 206):
+                        return False
+                    if resp.status == 200 and resume_from > 0:
+                        # 服务器不支持 Range，从头重下
+                        resume_from = 0
+                    # 总长度：206 看 Content-Range 的总数，200 看 Content-Length
+                    total_size = None
+                    content_range = resp.headers.get("Content-Range", "")
+                    if "/" in content_range:
+                        try:
+                            total_size = int(content_range.rsplit("/", 1)[-1])
+                        except ValueError:
+                            total_size = None
+                    if total_size is None:
+                        try:
+                            cl = int(resp.headers.get("Content-Length") or 0)
+                            total_size = (resume_from + cl) if cl else None
+                        except ValueError:
+                            total_size = None
+                    mode = "ab" if resp.status == 206 and resume_from > 0 else "wb"
+                    with tmp.open(mode) as fh:
                         async for chunk in resp.content.iter_chunked(65536):
                             fh.write(chunk)
-                if tmp.stat().st_size > 0:
+                final_size = tmp.stat().st_size if tmp.exists() else 0
+                if final_size > 0 and (total_size is None or final_size >= total_size):
                     tmp.replace(dest)
                     return True
-                tmp.unlink()
-                return False
+                # 没下完：留着 .part，下一次续传，不删
+                logger.warning(
+                    f"[{PLUGIN_NAME}] 图片 {idx} 未下完 "
+                    f"{final_size}/{total_size or '?'} 字节，留 .part 续传"
+                )
+                await asyncio.sleep(2 * (attempt + 1))
             except Exception as exc:
                 logger.warning(
                     f"[{PLUGIN_NAME}] 图片 {idx} 第 {attempt + 1} 次失败：{exc}"
                 )
-                # 清掉本轮可能留下的残文件
-                try:
-                    for part in folder.glob(f"{idx:04d}.*.part"):
-                        part.unlink()
-                except Exception:
-                    pass
+                # 关键：不要删 .part，留给下一次 Range 续传
                 await asyncio.sleep(2 * (attempt + 1))
         return False
