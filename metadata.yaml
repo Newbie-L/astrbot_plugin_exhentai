@@ -1,7 +1,7 @@
 name: astrbot_plugin_exhentai
 display_name: ExHentai 画廊下载
 desc: 监听 ExHentai / E-Hentai 画廊链接，下载后压缩成加密包发回触发会话，缺图自动重下
-version: v0.2.7
+version: v0.2.8
 author: Newbie-L
 repo: https://github.com/Newbie-L/astrbot_plugin_exhentai
 tags: [下载, 工具]

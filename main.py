@@ -1,6 +1,6 @@
 """ExHentai / E-Hentai 画廊下载插件 for AstrBot.
 
-工作方式（v0.2.7）：
+工作方式（v0.2.8）：
 1. 私聊里发一条带 exhentai.org / e-hentai.org 画廊链接的消息，
    或手动发 `/ex_dl <链接>`，插件把该画廊加入下载队列。
 2. 后台按画廊页 -> 图片页 -> 原图的顺序逐张下载到服务器本地。
@@ -57,7 +57,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
 PLUGIN_NAME = "astrbot_plugin_exhentai"
-PLUGIN_VERSION = "0.2.7"
+PLUGIN_VERSION = "0.2.8"
 PLUGIN_REPO = "https://github.com/Newbie-L/astrbot_plugin_exhentai"
 
 # https://exhentai.org/g/1234567/abcdef1234/  /  https://e-hentai.org/g/...
@@ -518,6 +518,24 @@ class ExHentaiDownloader(Star):
         yield event.plain_result(
             f"gid={gid} 校验发现坏图：{bad}，已删掉并开始重下，"
             f"补完会重新压缩发送。\n{msg}"
+        )
+
+    @filter.command("ex_help")
+    async def show_help(self, event: AstrMessageEvent):
+        """/ex_help：列出本插件所有命令。"""
+        yield event.plain_result(
+            "astrbot_plugin_exhentai 命令：\n"
+            "• 私聊发画廊链接：自动下载（默认只在私聊自动触发，群里不自动下）\n"
+            "• /ex_dl <链接>：手动加入下载队列\n"
+            "• /ex_status [gid]：查进度、压缩包路径、密码、缺图序号\n"
+            "• /ex_list：列出已完成的画廊\n"
+            "• /ex_send <gid>：把已压缩好的包和密码发到当前会话\n"
+            "• /ex_verify <gid>：校验图片，删掉残图/空白图并重下，补完重新压缩发送\n"
+            "• /ex_help：显示这份帮助\n"
+            "下载完且无缺图时会自动压缩成加密 zip（随机 6 位密码，包名=画廊标题）"
+            "并按触发会话发送：群触发发回群，私聊触发发回私聊；"
+            "没配 target_group_umo 时也一样，配了就优先发到配置的群。"
+            "缺图时会标 partial、不发不完整包，再跑 /ex_dl 只补缺图。"
         )
 
     @filter.command("ex_status")
