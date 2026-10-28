@@ -1,6 +1,6 @@
 """ExHentai / E-Hentai 画廊下载插件 for AstrBot.
 
-工作方式（v0.3.0）：
+工作方式（v0.3.1）：
 1. 私聊里发一条带 exhentai.org / e-hentai.org 画廊链接的消息，
    或手动发 `/ex_dl <链接>`，插件把该画廊加入下载队列。
 2. 后台按画廊页 -> 图片页 -> 原图的顺序逐张下载到服务器本地。
@@ -57,7 +57,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
 PLUGIN_NAME = "astrbot_plugin_exhentai"
-PLUGIN_VERSION = "0.3.0"
+PLUGIN_VERSION = "0.3.1"
 PLUGIN_REPO = "https://github.com/Newbie-L/astrbot_plugin_exhentai"
 
 # https://exhentai.org/g/1234567/abcdef1234/  /  https://e-hentai.org/g/...
@@ -604,11 +604,39 @@ class ExHentaiDownloader(Star):
                 (item.get("total") or 0) > 0
                 and (item.get("downloaded") or 0) < item["total"]
             )
+            and bool(item.get("zip_path"))
+            and Path(item["zip_path"]).exists()
         )
         if already_done:
+            # 之前这里只回一条带服务器路径的文本，不发文件，
+            # 用户在群里再发一次链接时就只看到路径、收不到包，
+            # 这就是 3493148 那次“为什么没有发送”的原因。
+            # 改成：更新触发会话为这次的会话，后台重新发送已有的包。
+            # 包找不到了则不算 already_done，后面会走正常流程跳过已有图片、
+            # 重新压缩发送。
+            zip_path = item["zip_path"]
+            self._set_state(gid, origin_umo=origin_umo)
+            password = item.get("zip_password") or ""
+            title = item.get("title") or link["url"]
+
+            async def _resend():
+                try:
+                    send_status = await self._send_zip_to_target(
+                        gid, title, Path(zip_path), password
+                    )
+                    self._set_state(gid, send_status=send_status)
+                except Exception as exc:
+                    logger.warning(
+                        f"[{PLUGIN_NAME}] gid={gid} 重发已有包失败：{exc}"
+                    )
+
+            try:
+                asyncio.create_task(_resend())
+            except Exception:
+                pass
             return (
-                f"✅ gid={gid} 已经下载过："
-                f"{item.get('zip_path') or item.get('folder', '')}"
+                f"✅ gid={gid} 已经下载过，正在把压缩包重新发到当前会话："
+                f"{Path(zip_path).name}"
             )
         # 正在跑的任务才算在队列里。重启插件后 _tasks 是空的，
         # 旧状态还停在 downloading 时不能直接说“已在队列”，否则永远卡住。
