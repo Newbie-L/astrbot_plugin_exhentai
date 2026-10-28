@@ -74,3 +74,6 @@ e-hentai.org 的公开画廊一般不需要 cookie；exhentai.org 没有 cookie 
 - `metadata.yaml`：插件信息
 - `_conf_schema.json`：后台配置项
 - `requirements.txt`：`aiohttp`
+
+
+v0.2.5 修了发送失败：用户 AstrBot 里 astrbot.api.message_components 没有 MessageChain，下载 44/44 完成后发包和降级文本都因此失败。新代码只 import 一定有的 Plain / File，找不到 MessageChain 就直接用组件列表发，找不到时再按几个可能位置找一遍。

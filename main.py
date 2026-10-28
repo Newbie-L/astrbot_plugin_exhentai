@@ -1,6 +1,6 @@
 """ExHentai / E-Hentai 画廊下载插件 for AstrBot.
 
-工作方式（v0.2.4）：
+工作方式（v0.2.5）：
 1. 私聊里发一条带 exhentai.org / e-hentai.org 画廊链接的消息，
    或手动发 `/ex_dl <链接>`，插件把该画廊加入下载队列。
 2. 后台按画廊页 -> 图片页 -> 原图的顺序逐张下载到服务器本地。
@@ -57,7 +57,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
 PLUGIN_NAME = "astrbot_plugin_exhentai"
-PLUGIN_VERSION = "0.2.4"
+PLUGIN_VERSION = "0.2.5"
 PLUGIN_REPO = "https://github.com/Newbie-L/astrbot_plugin_exhentai"
 
 # https://exhentai.org/g/1234567/abcdef1234/  /  https://e-hentai.org/g/...
@@ -182,6 +182,64 @@ def _origin_umo(event: AstrMessageEvent) -> str:
         if isinstance(value, str) and value:
             return value
     return ""
+
+
+def _build_file_chain(text: str, zip_path: Path | None = None):
+    """构造发文件用的消息链，兼容不同 AstrBot 版本。
+
+    v0.2.4 之前直接从 astrbot.api.message_components import MessageChain，
+    但用户 AstrBot 里那个模块根本没有 MessageChain 这个名字，
+    导致下载 44/44 完成后发送一步就失败、降级文本也一样失败。
+    改成：先只 import 一定有的 Plain / File 构造组件列表，
+    再尝试在几个可能的位置找 MessageChain 包一层，找不到就直接用列表发
+    （很多版本里 send_message / chain_result 本来就接受组件列表）。
+    File 的参数名在不同版本也可能不同，依次试 file / file_path。
+    返回 (chain, has_file)，has_file 为 False 时说明只发了文本。
+    """
+    from astrbot.api.message_components import File, Plain
+
+    components = [Plain(text=text)]
+    if zip_path is None:
+        return components, False
+    file_comp = None
+    for kwargs in (
+        {"file": str(zip_path), "name": zip_path.name},
+        {"file_path": str(zip_path), "name": zip_path.name},
+        {"file": str(zip_path)},
+        {"file_path": str(zip_path)},
+    ):
+        try:
+            file_comp = File(**kwargs)
+            break
+        except Exception:
+            continue
+    if file_comp is None:
+        return components, False
+    components.append(file_comp)
+    # 尝试找 MessageChain 包一层，找不到就用列表本身
+    for mod_name in (
+        "astrbot.api.message_components",
+        "astrbot.api.event",
+        "astrbot.core.message.components",
+        "astrbot.core.message.message_event_result",
+    ):
+        try:
+            import importlib
+
+            mod = importlib.import_module(mod_name)
+            chain_cls = getattr(mod, "MessageChain", None)
+            if chain_cls is None:
+                continue
+            try:
+                return chain_cls(chain=components), True
+            except Exception:
+                try:
+                    return chain_cls(components), True
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return components, True
 
 
 @register(
@@ -326,12 +384,7 @@ class ExHentaiDownloader(Star):
             f"解压密码：{item.get('zip_password', '')}"
         )
         try:
-            from astrbot.api.message_components import File, MessageChain, Plain
-
-            chain = MessageChain(chain=[
-                Plain(text=text),
-                File(file=str(zip_path), name=zip_path.name),
-            ])
+            chain, has_file = _build_file_chain(text, zip_path)
             if hasattr(event, "chain_result"):
                 self._set_state(gids[0], send_status="sent_manually")
                 yield event.chain_result(chain)
@@ -490,24 +543,17 @@ class ExHentaiDownloader(Star):
             f"解压密码：{password}"
         )
         try:
-            from astrbot.api.message_components import File, MessageChain, Plain
-
-            chain = MessageChain(chain=[
-                Plain(text=text),
-                File(file=str(zip_path), name=zip_path.name),
-            ])
+            chain, has_file = _build_file_chain(text, zip_path)
             await self.context.send_message(target, chain)
-            return "sent"
+            return "sent" if has_file else "text_only_file_failed"
         except Exception as exc:
             logger.warning(f"[{PLUGIN_NAME}] 发到 {target} 失败：{exc}")
-            # 降级：只发文本，至少让群里拿到密码和包名
+            # 降级：只发文本，至少让对方拿到密码和包名
             try:
-                from astrbot.api.message_components import MessageChain, Plain
-
-                await self.context.send_message(
-                    target,
-                    MessageChain(chain=[Plain(text=text + "\n（文件发送失败，包在服务器上）")]),
+                chain, _ = _build_file_chain(
+                    text + "\n（文件发送失败，包在服务器上）", None
                 )
+                await self.context.send_message(target, chain)
                 return "text_only_file_failed"
             except Exception as exc2:
                 logger.warning(f"[{PLUGIN_NAME}] 降级发文本也失败：{exc2}")
