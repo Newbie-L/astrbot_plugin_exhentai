@@ -1,6 +1,6 @@
 """ExHentai / E-Hentai 画廊下载插件 for AstrBot.
 
-工作方式（v0.2.9）：
+工作方式（v0.3.0）：
 1. 私聊里发一条带 exhentai.org / e-hentai.org 画廊链接的消息，
    或手动发 `/ex_dl <链接>`，插件把该画廊加入下载队列。
 2. 后台按画廊页 -> 图片页 -> 原图的顺序逐张下载到服务器本地。
@@ -8,7 +8,7 @@
    残文件写 .part、完整才重命名，不会把残文件当成功。
    2 轮后还缺的标 partial，不发不完整包，再跑 /ex_dl 只补缺的序号。
 3. 下载完且无缺图后把图片打成加密 zip：密码是随机 6 位数字，
-   压缩包名就是画廊标题（去掉文件名非法字符、截断到 120 字）。
+   压缩包名是密码_画廊标题（密码在最前面，去掉文件名非法字符、标题截到 110 字）。
 4. 压缩完后把压缩包和密码发到触发会话：
    - 优先发到配置里的 `target_group_umo`；
    - 没配的话就发回触发会话：群触发发回群，私聊触发发回私聊。
@@ -57,7 +57,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
 PLUGIN_NAME = "astrbot_plugin_exhentai"
-PLUGIN_VERSION = "0.2.9"
+PLUGIN_VERSION = "0.3.0"
 PLUGIN_REPO = "https://github.com/Newbie-L/astrbot_plugin_exhentai"
 
 # https://exhentai.org/g/1234567/abcdef1234/  /  https://e-hentai.org/g/...
@@ -117,6 +117,16 @@ def parse_image_src(html: str) -> str | None:
 def generate_zip_password() -> str:
     """随机 6 位数字密码，保留前导 0（用 secrets，不用 random）。"""
     return f"{secrets.randbelow(1_000_000):06d}"
+
+
+def zip_name_for(title: str, password: str) -> str:
+    """压缩包名：密码放最前面，再下划线加画廊标题。
+
+    例如：123456_[画廊标题].zip
+    标题截到 110 字，算上密码 6 位 + 下划线 1 位，总长度和以前
+    （标题 120 字）差不多，不会因为加密码就超长。
+    """
+    return f"{password}_{sanitize_filename(title, 110)}.zip"
 
 
 def create_encrypted_zip(folder: Path, zip_path: Path, password: str) -> str:
@@ -532,7 +542,7 @@ class ExHentaiDownloader(Star):
             "• /ex_send <gid>：把已压缩好的包和密码发到当前会话\n"
             "• /ex_verify <gid>：校验图片，删掉残图/空白图并重下，补完重新压缩发送\n"
             "• /ex_help：显示这份帮助\n"
-            "下载完且无缺图时会自动压缩成加密 zip（随机 6 位密码，包名=画廊标题）"
+            "下载完且无缺图时会自动压缩成加密 zip（随机 6 位密码，包名=密码_画廊标题，密码在最前面）"
             "并按触发会话发送：群触发发回群，私聊触发发回私聊；"
             "没配 target_group_umo 时也一样，配了就优先发到配置的群。"
             "缺图时不会悄悄停：超时/限流会持续重试（状态 retrying，"
@@ -908,9 +918,15 @@ class ExHentaiDownloader(Star):
                         )
                         # 仍先打一个现有图片的包备查，但不自动发送
                         self._set_state(gid, status="zipping")
-                        zip_name = f"{sanitize_filename(title, 120)}.zip"
-                        zip_path = self._download_dir() / zip_name
                         password = generate_zip_password()
+                        zip_path = self._download_dir() / zip_name_for(title, password)
+                        # 密码每次重打都会换，旧包名不同会残留，先删掉旧包
+                        _old = self.state.get(gid, {}).get("zip_path")
+                        if _old and Path(_old) != zip_path and Path(_old).exists():
+                            try:
+                                Path(_old).unlink()
+                            except Exception:
+                                pass
                         try:
                             method = await asyncio.to_thread(
                                 create_encrypted_zip, folder, zip_path, password
@@ -929,12 +945,17 @@ class ExHentaiDownloader(Star):
                             send_status="not_sent_missing_images",
                         )
                         return
-                    # ---- 下载完且无缺图：压缩成加密 zip，包名 = 画廊标题 ----
+                    # ---- 下载完且无缺图：压缩成加密 zip，包名 = 密码_画廊标题 ----
                     if downloaded > 0:
                         self._set_state(gid, status="zipping")
-                        zip_name = f"{sanitize_filename(title, 120)}.zip"
-                        zip_path = self._download_dir() / zip_name
                         password = generate_zip_password()
+                        zip_path = self._download_dir() / zip_name_for(title, password)
+                        _old = self.state.get(gid, {}).get("zip_path")
+                        if _old and Path(_old) != zip_path and Path(_old).exists():
+                            try:
+                                Path(_old).unlink()
+                            except Exception:
+                                pass
                         try:
                             method = await asyncio.to_thread(
                                 create_encrypted_zip, folder, zip_path, password
